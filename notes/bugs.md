@@ -238,6 +238,116 @@ slot      release: id 3 | task 1706 | stop processing: n_tokens = 4095, truncate
 
 ---
 
+### 第 14 条 · HTTP 500 `Context size has been exceeded` —— 改了 `-c` 还是撞顶
+
+现象：第 13 条发现 `truncated = 1` 后，把启动命令的 `-c 4096` 改成了 `-c 8192`，重启服务，
+**结果这次直接报错了**——而且是从 VSCode 那边抛出来的。
+
+报错（VSCode / Python 端）：
+```
+openai.InternalServerError: Error code: 500 - {'error': {'code': 500,
+  'message': 'Context size has been exceeded.', 'type': 'server_error'}}
+```
+
+报错（服务端日志，同一次请求）：
+```
+W decode: failed to find a memory slot for batch of size 2
+W decode: failed to find a free space in the KV cache for batch of size 2
+W decode:  - n_batch = 1024, n_ctx = 8192, n_kv    = 8192, n_keep = 1, n_past = 3506
+W decode:  - slot 0: n_ctx_slot = 4096, n_past = 3502, n_ctx_used = 3502
+...
+E decode: Context size has been exceeded.
+```
+
+### 这条报错怎么读（关键：只看一行）
+
+日志里信息量最大的是这一行：
+```
+W decode: - slot 0: n_ctx_slot = 4096, n_past = 3502, n_ctx_used = 3502
+                       ^^^^^^^^^^^^^^^^^^  这个槽实际只有 4096 额度
+```
+
+**明明 `-c 8192`，为什么槽只有 4096？** 因为启动命令里还有 `--parallel 4`（默认值）。
+
+### 原因：`n_slots` 把 `-c` 瓜分了
+
+```
+-c 8192  ÷  n_slots = 4  =  每个槽 4096
+```
+
+上下文总量是**所有并发槽共享**的一个池子，不是每槽各给 8192。
+槽位拿到 4096，而这次请求的输入就已经 3502 token 了 —— 加上要生成的输出，瞬间撑爆。
+
+### 引擎的三级降级过程（日志逐行对应）
+
+llama.cpp 撞上空间不足时不会立刻放弃，它会**一层层往下退**：
+
+| 顺序 | 日志 | 它在干什么 |
+|---|---|---|
+| 1 | `batch of size 2` | 原始批量 |
+| 2 | `n_batch = 1024` | 把批量切成 1024 再试 |
+| 3 | （再切更小） | 继续切 |
+| 4 | `E decode: Context size has been exceeded.` | 退无可退，报错 |
+
+**注意方向**：它是把**批量**切小（一次处理更少的 token），
+但**问题不是批量太大**，是**池子本身装不下**。所以切批量无效，最后只能报 500。
+
+⚠️ **这正是排查时最容易走偏的地方**：日志一直在说 `batch`，
+但真正的数字在 `n_ctx_slot` 那一行。**对着最响的噪音排查，是浪费时间。**
+
+### 解决方案
+
+```powershell
+.\llama-server.exe -m E:\llama\models\Qwen3-4B-Q4_K_M.gguf `
+  -ngl 99 -c 8192 --parallel 1 `
+  --cache-type-k q8_0 --cache-type-v q8_0 `
+  --port 8080
+```
+
+两处改动：
+- `--parallel 1` —— 单槽，**独吞整个 8192**
+- `--cache-type-k/v q8_0` —— KV cache 量化到 8 位，**显存占用减半**，给上下文腾地方
+
+**验证方法**：重启后看日志，必须出现
+```
+n_slots = 1, n_ctx_slot = 8192
+```
+看到 `n_ctx_slot = 8192` 才算真的生效。**改完不算完，要验证。**
+
+### 关于 HTTP 状态码：知道 4xx / 5xx 就能省一半排查功夫
+
+| 段 | 含义 | 责任方 | 你该看哪 |
+|---|---|---|---|
+| `4xx` | 客户端错误 | **你自己** | 你的代码、参数、地址 |
+| `5xx` | 服务端错误 | **对方** | 服务端日志、配置 |
+
+具体到这几条实战：
+
+| 报错 | 码 | 谁的问题 |
+|---|---|---|
+| `Missing credentials` | — | 你的代码（库自己抛的，不是 HTTP） |
+| `AuthenticationError 401` | 4xx | 你的地址（本地不校验 key，见第 12 条） |
+| `InternalServerError 500` | 5xx | **服务端**——你的 Python 代码没问题，去翻 llama-server 的日志 |
+
+### 教训
+
+> **看到 `500` 或 `InternalServerError`，别去看自己的代码。** 那是服务端在说"我顶不住了"，
+> 你的脚本只是**传话人**，它没写错。往服务端日志走。
+
+> **`-c` 不是每槽各给一份，是全场共享。** 多了一个 `--parallel`，
+> 每个请求实际能用的额度就除以槽数。**配置项之间有乘法关系，不是加法。**
+
+> **报错里喊得最响的那句，往往不是根因。** 这次日志满屏是 `batch size`，
+> 真凶藏在 `n_ctx_slot` 那一行不显眼的数字里。
+
+> **改完配置要验证，不看日志等于没改。** 这次"改了 `-c` 还是报错"，
+> 如果第一条就去看 `n_ctx_slot` 是多少，能省下整轮排查。
+
+> **错误是分层的：4xx 查自己，5xx 查对方。** 记住这一条，
+> 以后所有 HTTP 报错都能**先定位到哪一层**，再谈具体原因。
+
+---
+
 ## 九月十六日 · 本地部署的完整验证数据（存档用）
 
 | 项 | 值 |
@@ -274,6 +384,9 @@ token 越往后，KV cache 越大，注意力计算越重。**正常现象，不
 看到报错建议你设环境变量 → **判断它是兜底路径还是给你的建议**，别照做
 看到 `401` 但你知道密码本来就不校验 → **问题一定在地址上**
 看到程序"跑完了没报错" → **问一句"我怎么知道它这次是对的"**，去日志里找 `truncated`
+看到 `500` / `InternalServerError` → **服务端的问题，不要去看自己的代码**，去翻服务端日志
+看到 `Context size has been exceeded` → **先查 `n_slots` 是不是把 `-c` 瓜分了**（`-c ÷ n_slots = 每槽额度`）
+改了配置之后 → **不看日志验证，等于没改**
 **两个来源给出矛盾答案时** → 不是"哪个对"，是"**哪个更可信**"（追问数据是怎么来的）
 
 
