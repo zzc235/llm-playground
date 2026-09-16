@@ -12,7 +12,7 @@ with open("input.txt", "r",encoding="utf-8") as f:
 response = client.chat.completions.create(
     model=model,
     messages= [
-    {"role": "system", "content": "你的名字叫测试集1号"},{"role":"user","content":prompt} 
+    {"role": "system", "content": "你将担任一名老练的油气工程师，你的任务是核对我发送给你的笔记中的内容 要求1:不得覆盖原内容 要求2:对于存疑内容标记 ***等待人工查验 要求3:输出格式为原始内容+换行后的修改内容括号包起来+待查验"},{"role":"user","content":prompt} 
 
     ])
 
