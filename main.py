@@ -1,24 +1,45 @@
 import os
 from dotenv import load_dotenv
-from openai import OpenAI
+import os
+import logging
+import argparse
+from dotenv import load_dotenv
+from llm_client import call_llm  # 导入刚才写的函数
+
+# 1. 初始化日志 (解决图里的第4题)
+os.makedirs("logs", exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler("logs/app.log", encoding="utf-8"),
+        logging.StreamHandler()
+    ]
+)
+
 load_dotenv()
-api_key = os.getenv("DEEPSEEK_API_KEY")
-Base_URL= os.getenv("BASE_URL")
-model = os.getenv("MODEL_NAME")
-client = OpenAI(api_key=api_key,base_url=Base_URL)
-with open("input.txt", "r",encoding="utf-8") as f:
-    user_input = f.read()
-    prompt = f"请逐条核对以下笔记，指出错误和可改进之处"+f"\n{user_input}"
-response = client.chat.completions.create(
-    model=model,
-    messages= [
-    {"role": "system", "content": "你将担任一名老练的油气工程师，你的任务是核对我发送给你的笔记中的内容 要求1:不得覆盖原内容 要求2:对于存疑内容标记 ***等待人工查验 要求3:输出格式为原始内容+换行后的修改内容括号包起来+待查验"},{"role":"user","content":prompt} 
 
-    ])
+def main():
+    # 读取输入
+     # 设置命令行参数解析
+    parser = argparse.ArgumentParser(description="自动化剧本处理工具")
+    parser.add_argument("--input", default="input.txt", help="输入文件路径 (默认: input.txt)")
+    parser.add_argument("--output", default="output.txt", help="输出文件路径 (默认: output.txt)")
+    args = parser.parse_args() # 解析参数
 
-answer = response.choices[0].message.content
-with open("output.txt", "w",encoding ="utf-8") as f:
-    f.write(answer)
-print("完成，结果已经写入output.txt文件中")
+    logging.info(f"开始处理，输入文件: {args.input}，输出文件: {args.output}")
 
+    # 读取输入 (改成使用传入的参数)
+    with open(args.input, "r", encoding="utf-8") as f:
+        user_input = f.read()
 
+    # 调用 LLM
+    answer = call_llm(user_input)
+
+    # 写入输出 (改成使用传入的参数)
+    with open(args.output, "w", encoding="utf-8") as f:
+        f.write(answer)
+        
+    logging.info(f"完成，结果已经写入 {args.output} 文件中")
+if __name__ == "__main__":
+    main()
