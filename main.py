@@ -1,9 +1,7 @@
 import os
 from dotenv import load_dotenv
-import os
 import logging
 import argparse
-from dotenv import load_dotenv
 from llm_client import call_llm  # 导入刚才写的函数
 
 # 1. 初始化日志 (解决图里的第4题)

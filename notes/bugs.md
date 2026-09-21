@@ -389,5 +389,162 @@ token 越往后，KV cache 越大，注意力计算越重。**正常现象，不
 改了配置之后 → **不看日志验证，等于没改**
 **两个来源给出矛盾答案时** → 不是"哪个对"，是"**哪个更可信**"（追问数据是怎么来的）
 
+---
+
+# 九月十九日 · 工程化改造 review 挖出的三个预埋缺陷
+
+> ⚠️ **这三条和前面 14 条性质不同：它们还没有触发过。**
+> 是代码 review 提前挖出来的，下面的报错文本是**预期值**，真触发后要回来补录原文。
+>
+> 记它们的原因很简单：**其中第一条的同类版本你 09-16 已经踩过一次（第 12 条），
+> 但这次没把那条教训写进代码里。**
+
+---
+
+### 第 15 条 · `base_url` 没校验 —— 401 的同一个坑，换了个地方埋
+
+**位置**：`llm_client.py` 第 15–22 行
+
+```python
+api_key  = os.getenv("DEEPSEEK_API_KEY")   # 有检查（但检查方式见第 16 条）
+base_url = os.getenv("BASE_URL")           # ← 一个字都没管
+client = OpenAI(api_key=api_key, base_url=base_url)
+```
+
+**现象**：`BASE_URL` 拼错、漏配，或者哪天在 `.env` 里改了名字 →
+`base_url` 拿到 `None` → **程序不报错**，照常启动、照常发请求。
+
+**原因**：OpenAI SDK 在 `base_url=None` 时**不抛异常**，它默默退回默认地址
+`https://api.openai.com/v1`。于是你拿着 DeepSeek 的 key 去敲 OpenAI 的门。
+
+**预期报错（待触发后补录原文）**：
+```
+openai.AuthenticationError: Error code: 401
+```
+
+**⚠️ 和第 12 条是同一个规律**：
+
+| 条目 | 场景 | 401 的真正原因 |
+|---|---|---|
+| 第 12 条 | 本地 llama-server | 本地不校验 key → **请求根本没打到本地** |
+| 第 15 条 | 云端 DeepSeek | SDK 帮你兜底 → **请求打到了别的地址** |
+
+**两次都是：看到 401，先怀疑地址，不是 key。**
+
+**修正方案**（状态：待修）：三个 env 一视同仁全查，不许有裸奔的。
+```python
+for name in ("DEEPSEEK_API_KEY", "BASE_URL", "MODEL_NAME"):
+    if not os.getenv(name):
+        raise RuntimeError(f"缺少环境变量 {name}，请检查 .env 文件")
+```
+
+**教训**：
+> **有默认值的东西，坏起来是静默的。**
+> `model_name` 给了默认值（这是对的），但 `base_url` 毫无保护 ——
+> 而它恰好是**错了也不报错**的那一个，因为 SDK 会帮你兜底。
+> **兜底兜错了方向，比不兜底更危险。**
+
+---
+
+### 第 16 条 · 「打了一行 error 日志」不等于「早失败」
+
+**位置**：`llm_client.py` 第 19–22 行
+
+```python
+if not api_key:
+    logger.error("未找到 DEEPSEEK_API_KEY，请检查 .env 文件！")
+    # ← 没有 raise，程序继续往下跑
+client = OpenAI(api_key=api_key, base_url=base_url)
+```
+
+**现象**：`.env` 里没有 key 时，日志里确实出现了你写的那句中文提示 ——
+**但程序没有停，它继续建 client。**
+
+**原因**：`logger.error()` 只负责**记录**，不负责**中断**。
+日志是行车记录仪，不是刹车。
+
+**实际发生的事情**（预期报错）：
+```
+openai.OpenAIError: The api_key client option must be set either by passing
+api_key to the client or by setting the OPENAI_API_KEY environment variable
+```
+
+崩确实会崩 —— 但**崩出来的是 SDK 的英文报错，你精心写的中文提示等于白打了**。
+自己写的错误信息只有配合 `raise` 才有价值。
+
+**修正方案**（状态：待修）：二选一，别混用。
+```python
+# 方案 A：自己抛，错误信息归你控制
+if not api_key:
+    raise RuntimeError("未找到 DEEPSEEK_API_KEY，请检查 .env 文件")
+
+# 方案 B：干脆不用 getenv，取不到直接 KeyError
+api_key = os.environ["DEEPSEEK_API_KEY"]
+```
+
+**教训**：
+> **日志不是刹车。** 想「早失败」，就必须有一个 `raise`（或 `sys.exit`）——
+> 只打日志然后往下跑，等于什么都没做。
+>
+> 判断标准一句话：**程序有没有停在这一行？** 没停，就不是早失败。
+
+---
+
+### 第 17 条 · `retry` 没筛异常 —— 把不该重试的错也重试了 3 次
+
+**位置**：`llm_client.py` 第 26–30 行
+
+```python
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+#                                                                 ^^^^^^^^^^^^^^^^^^^^^^^
+#                                                                 导进来了，一次都没用
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=10),
+    reraise=True          # ← retry= 这个参数没给
+)
+```
+
+**现象**：不带 `retry=` 参数时，tenacity 默认**任何异常都重试**。
+
+**原因**：重试**只对「临时性故障」有意义**。把永久性错误也重试，结果是
+白白烧掉 3 次请求 + 约 4 秒等待，还把真正的错误信息埋进日志里。
+
+| 异常 | 该不该重试 | 为什么 |
+|---|---|---|
+| 429 限流 | ✅ 该 | 等一下真会好 |
+| 500 / 502 / 503 | ✅ 该 | 服务端抖动 |
+| 超时 / 连接断开 | ✅ 该 | 网络问题，重试有意义 |
+| **400 参数错** | ❌ **不该** | prompt 格式错了，重试 3 次还是 400 |
+| **401 认证错** | ❌ **不该** | key 或地址错了，重试 3 次还是 401 |
+| **`TypeError`** | ❌ **不该** | 自己代码的 bug，等一万年也一样 |
+
+**修正方向**（状态：待修）：给 `retry=` 传 `retry_if_exception_type(...)`，
+只圈出**临时性异常**。方向：去 `openai` 库里找现成的异常类，
+按「429 / 5xx / 超时」这三类去筛。
+
+**教训**：
+> **判断规则一句话：「等一下再试，有没有可能好？」**
+> 答案是「否」→ 不重试。
+>
+> 另外：**import 了却没用，是代码在给你留线索。**
+> `retry_if_exception_type` 出现在第 4 行，说明写的时候想过这件事，
+> 只是没走到最后一步。以后看到"导了没用"的包，回头问一句「我本来打算干嘛」。
+
+---
+
+## 九月十九日教训（速查）
+
+| 看到什么 | 先想什么 |
+|---|---|
+| 有 `default=` 或有 SDK 兜底的配置项 | **它错了会不会报错？** 不会 → 必须自己校验（第 15 条） |
+| 打了 `logger.error` 但程序继续跑 | **这不是早失败。** 没 `raise` 就是没停（第 16 条） |
+| 看到 401 | **先怀疑地址，不是 key**（第 12 条 / 第 15 条通用） |
+| 写重试逻辑 | **先问「等一下再试有没有可能好」**，再决定哪些异常进重试圈（第 17 条） |
+| 发现自己 import 了没用的东西 | 那是**写的时候想过、但没做完**的信号，回去补（第 17 条） |
+| 提交代码前 | message 写**改了什么**，不写「谁帮的忙」、不写「今日成果」 |
+
+
 
 
